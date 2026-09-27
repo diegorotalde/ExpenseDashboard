@@ -36,6 +36,9 @@ def fetch_transactions() -> pd.DataFrame:
     transactions = pd.DataFrame(response.data)
     transactions["date"] = pd.to_datetime(transactions["date"], errors="coerce")
     transactions["amount"] = pd.to_numeric(transactions["amount"], errors="coerce")
+    if "wallet" not in transactions.columns:
+        transactions["wallet"] = "Unknown"
+    transactions["wallet"] = transactions["wallet"].fillna("Unknown").astype(str).str.strip()
     return transactions.dropna(subset=["date", "amount"])
 
 
@@ -70,6 +73,7 @@ def parse_transactions_csv(uploaded_file) -> tuple[pd.DataFrame | None, list[str
     transactions["date"] = pd.to_datetime(transactions["date"], errors="coerce")
     transactions["amount"] = pd.to_numeric(transactions["amount"], errors="coerce")
     transactions["type"] = transactions["type"].astype(str).str.strip().str.capitalize()
+    transactions["wallet"] = transactions["wallet"].fillna("Unknown").astype(str).str.strip()
     transactions["category"] = transactions["category"].fillna("").astype(str).str.strip()
     transactions["description"] = transactions["description"].fillna("").astype(str).str.strip()
 
@@ -82,20 +86,22 @@ def parse_transactions_csv(uploaded_file) -> tuple[pd.DataFrame | None, list[str
     return transactions, []
 
 
-def upload_transactions(transactions: pd.DataFrame) -> tuple[int, int]:
-    inserted_count = 0
-    skipped_count = 0
-    database_columns = ["date", "description", "category", "amount", "type", "unique_hash"]
+def upload_transactions(transactions: pd.DataFrame) -> int:
+    database_columns = [
+        "date", "wallet", "description", "category", "amount", "type", "unique_hash"
+    ]
+    records = transactions[database_columns].to_dict(orient="records")
+    for record in records:
+        record["date"] = str(record["date"])
+        record["wallet"] = str(record["wallet"])
+        record["description"] = str(record["description"])
+        record["category"] = str(record["category"])
+        record["amount"] = float(record["amount"])
+        record["type"] = str(record["type"])
+        record["unique_hash"] = str(record["unique_hash"])
 
-    for _, row in transactions.iterrows():
-        record = {column: row[column] for column in database_columns}
-        try:
-            supabase.table("transactions").insert(record).execute()
-            inserted_count += 1
-        except Exception:
-            skipped_count += 1
-
-    return inserted_count, skipped_count
+    response = supabase.table("transactions").insert(records).execute()
+    return len(response.data or [])
 
 
 def render_uploader() -> None:
@@ -126,12 +132,22 @@ def render_uploader() -> None:
         st.dataframe(parsed_transactions.head(), use_container_width=True)
 
         if st.button("Add transactions", key="add_transactions"):
-            inserted_count, skipped_count = upload_transactions(parsed_transactions)
-            st.success(
-                f"Added {inserted_count} transaction(s). "
-                f"Skipped {skipped_count} duplicate or invalid transaction(s)."
-            )
-            st.rerun()
+            if parsed_transactions.empty:
+                st.warning("The CSV does not contain any transaction rows.")
+            else:
+                try:
+                    inserted_count = upload_transactions(parsed_transactions)
+                    if inserted_count == len(parsed_transactions):
+                        st.success(
+                            f"Successfully uploaded {inserted_count} transaction(s) to Supabase."
+                        )
+                    else:
+                        st.warning(
+                            f"Supabase accepted {inserted_count} of "
+                            f"{len(parsed_transactions)} transaction(s)."
+                        )
+                except Exception as error:
+                    st.error(f"Supabase upload failed: {error}")
 
 
 def render_monthly_dashboard() -> None:
@@ -145,50 +161,33 @@ def render_monthly_dashboard() -> None:
 
     transactions["month_year"] = transactions["date"].dt.to_period("M").astype(str)
     expenses = transactions[transactions["type"] == "Expense"]
-    col1, col2 = st.columns(2)
+    st.subheader("Category Spending Over Time")
+    if expenses.empty:
+        st.info("No expense data available.")
+        return
 
-    with col1:
-        st.subheader("Category Spending Over Time")
-        if expenses.empty:
-            st.info("No expense data available.")
-        else:
-            category_totals = expenses.groupby(
-                ["month_year", "category"], as_index=False
-            )["amount"].sum()
-            chart = px.bar(
-                category_totals,
-                x="month_year",
-                y="amount",
-                color="category",
-                barmode="stack",
-                labels={"month_year": "Month", "amount": "Amount"},
-            )
-            st.plotly_chart(chart, use_container_width=True)
-
-    with col2:
-        st.subheader("Net Wealth")
-        totals = transactions.groupby(["month_year", "type"])["amount"].sum().unstack(fill_value=0)
-        totals["Income"] = totals.get("Income", 0)
-        totals["Expense"] = totals.get("Expense", 0)
-        totals["Net Wealth"] = totals["Income"] - totals["Expense"]
-        chart = px.line(
-            totals.reset_index(),
-            x="month_year",
-            y="Net Wealth",
-            markers=True,
-            labels={"month_year": "Month", "Net Wealth": "Net Surplus"},
-        )
-        st.plotly_chart(chart, use_container_width=True)
-
-    summary = transactions.groupby(["month_year", "type"])["amount"].sum().unstack(fill_value=0)
-    summary["Income"] = summary.get("Income", 0)
-    summary["Expense"] = summary.get("Expense", 0)
-    summary["Net Savings"] = summary["Income"] - summary["Expense"]
-    st.subheader("📋 Month-to-Month Summary")
-    st.dataframe(
-        summary.reset_index().sort_values("month_year", ascending=False),
-        use_container_width=True,
+    wallet_options = ["All wallets"] + sorted(expenses["wallet"].unique().tolist())
+    selected_wallet = st.selectbox(
+        "Filter by wallet",
+        wallet_options,
+        key="category_spending_wallet",
     )
+    chart_expenses = expenses
+    if selected_wallet != "All wallets":
+        chart_expenses = expenses[expenses["wallet"] == selected_wallet]
+
+    category_totals = chart_expenses.groupby(
+        ["month_year", "category"], as_index=False
+    )["amount"].sum()
+    chart = px.bar(
+        category_totals,
+        x="month_year",
+        y="amount",
+        color="category",
+        barmode="stack",
+        labels={"month_year": "Month", "amount": "Amount", "category": "Category"},
+    )
+    st.plotly_chart(chart, use_container_width=True)
 
 
 def render_shared_expenses() -> None:
