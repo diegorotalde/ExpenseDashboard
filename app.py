@@ -30,7 +30,19 @@ def fetch_transactions() -> pd.DataFrame:
     response = supabase.table("transactions").select("*").execute()
     if not response.data:
         return pd.DataFrame(
-            columns=["id", "date", "description", "category", "amount", "type", "unique_hash"]
+            columns=[
+                "id",
+                "date",
+                "wallet",
+                "type",
+                "category",
+                "amount",
+                "currency",
+                "description",
+                "labels",
+                "author",
+                "unique_hash",
+            ]
         )
 
     transactions = pd.DataFrame(response.data)
@@ -38,7 +50,10 @@ def fetch_transactions() -> pd.DataFrame:
     transactions["amount"] = pd.to_numeric(transactions["amount"], errors="coerce")
     if "wallet" not in transactions.columns:
         transactions["wallet"] = "Unknown"
+    if "author" not in transactions.columns:
+        transactions["author"] = "Unknown"
     transactions["wallet"] = transactions["wallet"].fillna("Unknown").astype(str).str.strip()
+    transactions["author"] = transactions["author"].fillna("Unknown").astype(str).str.strip()
     return transactions.dropna(subset=["date", "amount"])
 
 
@@ -50,7 +65,7 @@ def fetch_split_config() -> tuple[float, float]:
 
 
 def generate_hash(row: pd.Series) -> str:
-    columns = ["date", "description", "category", "amount", "type"]
+    columns = ["date", "wallet", "description", "category", "amount", "type"]
     values = [row.get(column, "") for column in columns]
     return hashlib.md5("|".join(map(str, values)).encode("utf-8")).hexdigest()
 
@@ -76,6 +91,9 @@ def parse_transactions_csv(uploaded_file) -> tuple[pd.DataFrame | None, list[str
     transactions["wallet"] = transactions["wallet"].fillna("Unknown").astype(str).str.strip()
     transactions["category"] = transactions["category"].fillna("").astype(str).str.strip()
     transactions["description"] = transactions["description"].fillna("").astype(str).str.strip()
+    transactions["currency"] = transactions["currency"].fillna("").astype(str).str.strip()
+    transactions["labels"] = transactions["labels"].fillna("").astype(str).str.strip()
+    transactions["author"] = transactions["author"].fillna("Unknown").astype(str).str.strip()
 
     invalid_rows = transactions[transactions["date"].isna() | transactions["amount"].isna()]
     if not invalid_rows.empty:
@@ -88,16 +106,28 @@ def parse_transactions_csv(uploaded_file) -> tuple[pd.DataFrame | None, list[str
 
 def upload_transactions(transactions: pd.DataFrame) -> int:
     database_columns = [
-        "date", "wallet", "description", "category", "amount", "type", "unique_hash"
+        "date",
+        "wallet",
+        "type",
+        "category",
+        "amount",
+        "currency",
+        "description",
+        "labels",
+        "author",
+        "unique_hash",
     ]
     records = transactions[database_columns].to_dict(orient="records")
     for record in records:
         record["date"] = str(record["date"])
         record["wallet"] = str(record["wallet"])
-        record["description"] = str(record["description"])
+        record["type"] = str(record["type"])
         record["category"] = str(record["category"])
         record["amount"] = float(record["amount"])
-        record["type"] = str(record["type"])
+        record["currency"] = str(record["currency"])
+        record["description"] = str(record["description"])
+        record["labels"] = str(record["labels"])
+        record["author"] = str(record["author"])
         record["unique_hash"] = str(record["unique_hash"])
 
     response = supabase.table("transactions").insert(records).execute()
@@ -150,6 +180,25 @@ def render_uploader() -> None:
                     st.error(f"Supabase upload failed: {error}")
 
 
+def wallet_key(wallet: pd.Series) -> pd.Series:
+    return wallet.fillna("").astype(str).str.strip().str.casefold()
+
+
+def monthly_totals(transactions: pd.DataFrame, year: int, value_column: str) -> pd.DataFrame:
+    months = pd.DataFrame({"month_number": range(1, 13)})
+    months["month"] = pd.to_datetime(
+        {"year": year, "month": months["month_number"], "day": 1}
+    ).dt.strftime("%b")
+    totals = (
+        transactions[transactions["date"].dt.year == year]
+        .assign(month_number=lambda frame: frame["date"].dt.month)
+        .groupby("month_number", as_index=False)[value_column]
+        .sum()
+    )
+    result = months.merge(totals, on="month_number", how="left").fillna({value_column: 0})
+    return result
+
+
 def render_monthly_dashboard() -> None:
     st.title("📊 Monthly Dashboard")
     render_uploader()
@@ -159,35 +208,103 @@ def render_monthly_dashboard() -> None:
         st.info("No transaction data available. Upload a CSV above to get started.")
         return
 
-    transactions["month_year"] = transactions["date"].dt.to_period("M").astype(str)
-    expenses = transactions[transactions["type"] == "Expense"]
-    st.subheader("Category Spending Over Time")
-    if expenses.empty:
-        st.info("No expense data available.")
-        return
+    years = sorted(transactions["date"].dt.year.unique().tolist(), reverse=True)
+    selected_year = st.selectbox("Year", years, index=0, key="monthly_dashboard_year")
+    diego_pct, _ = fetch_split_config()
 
-    wallet_options = ["All wallets"] + sorted(expenses["wallet"].unique().tolist())
-    selected_wallet = st.selectbox(
-        "Filter by wallet",
-        wallet_options,
-        key="category_spending_wallet",
-    )
-    chart_expenses = expenses
-    if selected_wallet != "All wallets":
-        chart_expenses = expenses[expenses["wallet"] == selected_wallet]
+    transactions["wallet_key"] = wallet_key(transactions["wallet"])
+    transactions["type_key"] = transactions["type"].fillna("").astype(str).str.casefold()
+    transactions["author_key"] = transactions["author"].fillna("").astype(str).str.casefold()
+    transactions["absolute_amount"] = transactions["amount"].abs()
 
-    category_totals = chart_expenses.groupby(
-        ["month_year", "category"], as_index=False
-    )["amount"].sum()
-    chart = px.bar(
-        category_totals,
-        x="month_year",
-        y="amount",
-        color="category",
-        barmode="stack",
-        labels={"month_year": "Month", "amount": "Amount", "category": "Category"},
+    year_transactions = transactions[transactions["date"].dt.year == selected_year]
+    expenses = year_transactions[year_transactions["type_key"] == "expense"].copy()
+    expenses = expenses[
+        expenses["wallet_key"].str.contains("cuenta sueldo|pagos compartidos", regex=True)
+    ]
+    expenses["expense_amount"] = expenses["absolute_amount"]
+
+    st.subheader("Total expenses over time")
+    expense_wallet = st.selectbox(
+        "Wallet",
+        [
+            "All wallets",
+            "Pagos compartidos (full amount)",
+            "Cuenta Sueldo",
+            "Pagos compartidos (Diego’s amount)",
+        ],
+        key="total_expenses_wallet",
     )
-    st.plotly_chart(chart, use_container_width=True)
+
+    if expense_wallet == "Cuenta Sueldo":
+        chart_expenses = expenses[expenses["wallet_key"].str.contains("cuenta sueldo")].copy()
+    elif expense_wallet.startswith("Pagos compartidos"):
+        chart_expenses = expenses[expenses["wallet_key"].str.contains("pagos compartidos")].copy()
+        if expense_wallet == "Pagos compartidos (Diego’s amount)":
+            chart_expenses["expense_amount"] *= diego_pct / 100
+    else:
+        chart_expenses = expenses.copy()
+
+    categories = sorted(chart_expenses["category"].dropna().unique().tolist())
+    selected_categories = st.multiselect(
+        "Expense categories",
+        categories,
+        default=categories,
+        key="total_expenses_categories",
+    )
+    if selected_categories:
+        chart_expenses = chart_expenses[chart_expenses["category"].isin(selected_categories)]
+    else:
+        chart_expenses = chart_expenses.iloc[0:0]
+
+    expense_chart = monthly_totals(chart_expenses, selected_year, "expense_amount")
+    st.bar_chart(expense_chart, x="month", y="expense_amount", height=350)
+
+    st.subheader("Monthly Income")
+    income = year_transactions[year_transactions["type_key"] == "income"].copy()
+    income["income_amount"] = income["absolute_amount"]
+    income_chart = monthly_totals(income, selected_year, "income_amount")
+    st.bar_chart(income_chart, x="month", y="income_amount", height=350)
+
+    st.subheader("Pagos compartidos vs. Cuenta Sueldo")
+    shared_year = st.selectbox(
+        "Year for wallet comparison",
+        years,
+        index=0,
+        key="wallet_comparison_year",
+    )
+    comparison_expenses = transactions[
+        (transactions["date"].dt.year == shared_year)
+        & (transactions["type_key"] == "expense")
+        & (transactions["author_key"].str.contains("diego rotalde"))
+    ].copy()
+    comparison_expenses["Cuenta Sueldo"] = comparison_expenses["absolute_amount"].where(
+        comparison_expenses["wallet_key"].str.contains("cuenta sueldo"), 0
+    )
+    comparison_expenses["Pagos Compartidos"] = comparison_expenses["absolute_amount"].where(
+        comparison_expenses["wallet_key"].str.contains("pagos compartidos"), 0
+    )
+    comparison_expenses["Pagos Compartidos"] *= diego_pct / 100
+    comparison_months = pd.DataFrame({"month_number": range(1, 13)})
+    comparison_months["month"] = pd.to_datetime(
+        {"year": shared_year, "month": comparison_months["month_number"], "day": 1}
+    ).dt.strftime("%b")
+    comparison_totals = (
+        comparison_expenses.assign(month_number=comparison_expenses["date"].dt.month)
+        .groupby("month_number", as_index=False)[["Cuenta Sueldo", "Pagos Compartidos"]]
+        .sum()
+    )
+    comparison_chart = comparison_months.merge(
+        comparison_totals, on="month_number", how="left"
+    ).fillna(0)
+    st.bar_chart(
+        comparison_chart,
+        x="month",
+        y=["Cuenta Sueldo", "Pagos Compartidos"],
+        color=["#2563eb", "#f97316"],
+        stack=True,
+        height=350,
+    )
 
 
 def render_shared_expenses() -> None:
